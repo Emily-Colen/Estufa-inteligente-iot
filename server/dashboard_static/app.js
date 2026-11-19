@@ -7,7 +7,11 @@ let records = [];
 let busy = false;
 let latestKnownId = null;
 let lastSuccess = null;
-const POLL_MS = 10000;
+let latestBusy = false;
+let historyBusy = false;
+let lastHistoryFetch = 0;
+const POLL_MS = 5000;
+const HISTORY_MS = 30000;
 function fmt(value, suffix = '', decimals = 1) {
   return (typeof value === 'number' && Number.isFinite(value))
     ? value.toLocaleString('pt-BR', {minimumFractionDigits: decimals, maximumFractionDigits: decimals}) + suffix
@@ -22,9 +26,18 @@ function setBoolean(id, value, yes = 'Ligada', no = 'Desligada') {
   el.classList.toggle('on', value === true); el.classList.toggle('bad', id === 'reservoirStatus' && value === false);
 }
 async function getJson(url) {
-  const result = await fetch(url, {headers: {'X-Admin-Key': adminKey}, cache: 'no-store'});
-  if (!result.ok) throw new Error(result.status === 401 || result.status === 422 ? 'ADMIN_KEY incorreta ou não autorizada.' : `Falha na consulta HTTP ${result.status}.`);
-  return result.json();
+  // Evita deixar uma requisicao travada indefinidamente.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12000);
+  try {
+    const result = await fetch(url, {
+      headers: {'X-Admin-Key': adminKey}, cache: 'no-store', signal: controller.signal
+    });
+    if (!result.ok) throw new Error(result.status === 401 || result.status === 422 ? 'ADMIN_KEY incorreta ou não autorizada.' : `Falha na consulta HTTP ${result.status}.`);
+    return await result.json();
+  } finally {
+    clearTimeout(timer);
+  }
 }
 // Estimativa do acionamento da luz a partir de luminosity (0 a 100%).
 // Reconstitui a histerese percorrendo o histórico em ordem cronológica.
@@ -113,26 +126,52 @@ function draw() {
  if(first){ctx.fillText(first.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}),plot.left, h-12)}
  if(last){const label=last.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});ctx.fillText(label,plot.right-40,h-12)}
 }
-async function refresh() {
- if (!adminKey || busy) return;
- busy = true;
+async function refreshLatest() {
+ if (!adminKey || latestBusy) return;
+ latestBusy = true;
+ const t0 = performance.now();
  try {
-  const [latest,history] = await Promise.all([getJson(API.latest),getJson(API.history+$('historyLimit').value)]);
-  records = Array.isArray(history.data)?history.data:[];
-  renderLatest(latest);populateTable(records);draw();warn('');lastSuccess=Date.now();
-  $('lastRefresh').textContent = 'Atualizado às ' + new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
-  $('historyCaption').textContent = `${records.length} medições exibidas · Temperatura usa escala 0–60 °C; umidades usam escala 0–100%.`;
- } catch (err) {
-  badge('Conexão indisponível','offline');warn(err.message + ' Verifique a ADMIN_KEY e se o Render está ativo.');
+  const latest = await getJson(API.latest);
+  renderLatest(latest);
+  warn(''); lastSuccess = Date.now();
+  const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+  $('lastRefresh').textContent = 'Consulta: ' + elapsed + ' s · Atualizado às ' + new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+ } catch(err) {
+  const message = err.name === 'AbortError' ? 'A API demorou mais de 12 segundos para responder.' : err.message;
+  badge('Conexão indisponível','offline');
+  warn(message + ' Verifique sua conexão e os logs do Render.');
   if (!lastSuccess) $('signalDescription').textContent='Não foi possível acessar os dados.';
- } finally { busy = false; }
+ } finally { latestBusy=false; }
+}
+async function refreshHistory(force=false) {
+ if (!adminKey || historyBusy || (!force && Date.now()-lastHistoryFetch < HISTORY_MS)) return;
+ historyBusy = true;
+ try {
+  const history = await getJson(API.history+$('historyLimit').value);
+  records = Array.isArray(history.data) ? history.data : [];
+  lastHistoryFetch = Date.now();
+  populateTable(records); draw();
+  $('historyCaption').textContent = `${records.length} medições exibidas · Temperatura usa escala 0–60 °C; umidades usam escala 0–100%.`;
+  // A estimativa da luz utiliza o historico; recalcular apos chegada dos dados.
+  if (records.length) {
+   const newest = [...records].sort((a,b)=>(safeDate(a.created_at)?.getTime()??0)-(safeDate(b.created_at)?.getTime()??0)).at(-1);
+   if (newest && latestKnownId === newest.id) renderLatest(newest);
+  }
+ } catch(err) {
+  // Falha do historico nao deve bloquear a leitura mais recente.
+  console.warn('Histórico indisponível:', err);
+ } finally { historyBusy=false; }
+}
+function refresh() {
+ refreshLatest();
+ refreshHistory();
 }
 const overlay = $('authOverlay');
 function showAuth() {overlay.hidden=false;$('adminKey').value='';$('adminKey').focus();}
 $('openAuth').addEventListener('click', showAuth);
 $('cancelAuth').addEventListener('click', ()=>{overlay.hidden=true;});
 $('authForm').addEventListener('submit',(e)=>{e.preventDefault();adminKey=$('adminKey').value.trim();overlay.hidden=true;lastSuccess=null;refresh();});
-$('historyLimit').addEventListener('change',refresh);
+$('historyLimit').addEventListener('change',()=>refreshHistory(true));
 window.addEventListener('resize',()=>draw());
 window.setInterval(refresh,POLL_MS);
 window.addEventListener('focus',()=>refresh());
