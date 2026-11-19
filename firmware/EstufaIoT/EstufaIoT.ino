@@ -1,169 +1,328 @@
-/* Estufa IoT: prototipo academico ESP32, DHT22, sensor solo analogico, boia,
-   ventoinha 12V e bomba 12V. HTTPS recomendado em implantacao.
-   Bibliotecas: DHT sensor library (Adafruit), Adafruit Unified Sensor,
-                ArduinoJson v7.
-*/
+
+#include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <DHT.h>
-#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <time.h>
+#include <math.h>
 
-#define DHT_PIN 4
-#define DHT_TYPE DHT22
-#define SOIL_PIN 34
-#define FLOAT_PIN 27
-#define FAN_PIN 25
-#define PUMP_PIN 26
+constexpr uint8_t PIN_DHT = 4;
+constexpr uint8_t PIN_SOIL = 34;
+constexpr uint8_t PIN_LIGHT = 35;
+constexpr uint8_t PIN_TANK = 33;
+constexpr uint8_t PIN_FAN = 26;
+constexpr uint8_t PIN_PUMP = 27;
+constexpr uint8_t PIN_GROWLIGHT = 2;
 
-// NAO acione motores diretamente pelos GPIOs. Use drivers e fonte separada.
-const char* WIFI_SSID = "SEU_WIFI";
-const char* WIFI_PASS = "SUA_SENHA";
-const char* DEVICE_KEY = "dev-device-change-me";
-const char* DEVICE_ID = "estufa-01";
+const char *WIFI_SSID = "Wokwi-GUEST";
+const char *WIFI_PASSWORD = "";
+const char *API_HOST = "estufa-inteligente-iot.onrender.com";
+const char *API_URL = "https://estufa-inteligente-iot.onrender.com/api/telemetry";
+const char *DEVICE_KEY = "";
+const char *DEVICE_ID = "estufa-01";
 
-// Para testes locais com servidor HTTP: USE_LOCAL_HTTP=true e IP do PC na LAN.
-// Para producao: USE_LOCAL_HTTP=false, URL https e CA raiz valida.
-const bool USE_LOCAL_HTTP = true;
-const char* SERVER_URL = "http://192.168.1.100:8000";
-const char* ROOT_CA = R"CA(
------BEGIN CERTIFICATE-----
-COLE_A_CA_RAIZ_DA_SUA_HOSPEDAGEM_HTTPS
------END CERTIFICATE-----
-)CA";
+// Modo de demonstracao: nao utiliza arquivo de CA.
 
-// Calibrar lendo valores ADC em solo seco e umido no prototipo.
-const int SOIL_DRY = 3200;
-const int SOIL_WET = 1400;
-// Boia liga pino ao GND com reservatorio em nivel seguro.
-const bool FLOAT_OK_LEVEL = LOW;
-const unsigned long SAMPLE_MS=5000, SYNC_MS=10000;
-const unsigned long PUMP_MAX_MS=12000, PUMP_COOLDOWN_MS=30000;
-const unsigned long WIFI_RETRY_MS=10000;
-DHT dht(DHT_PIN,DHT_TYPE);
-float temp=NAN, hum=NAN, soil=NAN;
-bool tankOk=false, fanOn=false, pumpOn=false, sensorsOk=false;
-String mode="auto", alert="SEM_LEITURA";
-float target=27, soilMin=35, soilStop=55;
-bool manualFan=false, manualPump=false;
-unsigned long lastSample=0,lastSync=0,lastWiFiRetry=0;
-unsigned long pumpStarted=0,pumpStopped=0;
-bool pumpEverStopped=false;
+// LIMITES DIDATICOS
+constexpr float TEMP_FAN_ON = 29.0f;
+constexpr float TEMP_FAN_OFF = 27.0f;
+constexpr float HUMIDITY_FAN_ON = 80.0f;
+constexpr float HUMIDITY_FAN_OFF = 70.0f;
+constexpr float SOIL_PUMP_ON = 40.0f;
+constexpr float SOIL_PUMP_OFF = 55.0f;
+constexpr float LIGHT_GROW_ON = 30.0f;
+constexpr float LIGHT_GROW_OFF = 50.0f;
 
-void setPump(bool on) {
-  if(on==pumpOn) return;
-  pumpOn=on;
-  digitalWrite(PUMP_PIN,on?HIGH:LOW);
-  if(on) pumpStarted=millis();
-  else {pumpStopped=millis();pumpEverStopped=true;}
-}
-void setFan(bool on){fanOn=on;digitalWrite(FAN_PIN,on?HIGH:LOW);}
+constexpr unsigned long SENSOR_PERIOD = 3000UL;
+constexpr unsigned long POST_PERIOD = 15000UL;
+constexpr unsigned long WIFI_RETRY = 10000UL;
+constexpr unsigned long MAX_PUMP_MS = 10000UL;
+constexpr unsigned long PUMP_COOLDOWN_MS = 20000UL;
+constexpr unsigned long DHT_STALE_MS = 9000UL;
 
-void controlLoop(){
-  if(!tankOk || !sensorsOk){setPump(false);}
-  if(!sensorsOk){setFan(false);alert="FALHA_SENSOR";return;}
-  if(!tankOk) alert="RESERVATORIO_BAIXO";
-  else if(temp>target+4)alert="TEMPERATURA_ALTA";
-  else if(soil<soilMin)alert="SOLO_SECO";
-  else alert="NORMAL";
+// Potenciometro Wokwi: 0 = molhado, 4095 = seco
+constexpr int RAW_WET = 0;
+constexpr int RAW_DRY = 4095;
 
-  if(mode=="manual"){
-    setFan(manualFan);
-    if(!tankOk || !manualPump) setPump(false);
-    else if(!pumpOn && (!pumpEverStopped || millis()-pumpStopped>=PUMP_COOLDOWN_MS)) setPump(true);
-  } else {
-    // Histerese: liga acima de alvo+1; desliga abaixo de alvo-0.5.
-    if(temp>=target+1.0)setFan(true);
-    else if(temp<=target-0.5)setFan(false);
+DHT dht(PIN_DHT, DHT22);
+Adafruit_SSD1306 oled(128, 64, &Wire, -1);
+bool oledReady = false;
 
-    if(!tankOk || soil>=soilStop)setPump(false);
-    else if(soil<=soilMin && !pumpOn &&
-            (!pumpEverStopped || millis()-pumpStopped>=PUMP_COOLDOWN_MS))setPump(true);
+float tempC = NAN, airPct = NAN, soilPct = 0, lightPct = 0;
+bool reservoirOK = false, sensorOK = false;
+bool fanOn = false, pumpOn = false, growLightOn = false;
+bool cooldown = false;
+unsigned long lastSample = 0, lastPost = 0, lastWifiTry = 0;
+unsigned long lastValidDht = 0, pumpStart = 0, pumpStopped = 0;
+bool wifiAttempted = false;
+
+void stopPump(unsigned long now)
+{
+  if (pumpOn)
+  {
+    pumpOn = false;
+    pumpStopped = now;
+    cooldown = true;
+    digitalWrite(PIN_PUMP, LOW);
+    Serial.println("[BOMBA] Desligada");
   }
-  // Limite de tempo: desligamento e espera mesmo se o solo continuar seco.
-  if(pumpOn && millis()-pumpStarted>=PUMP_MAX_MS){setPump(false);alert="BOMBA_TEMPO_MAXIMO";}
 }
 
-void sample(){
-  float t=dht.readTemperature(), h=dht.readHumidity();
-  int adc=analogRead(SOIL_PIN);
-  tankOk=(digitalRead(FLOAT_PIN)==FLOAT_OK_LEVEL);
-  sensorsOk=isfinite(t)&&isfinite(h)&&t>=-10&&t<=65&&h>=0&&h<=100;
-  if(sensorsOk){temp=t;hum=h;} // Mantem ultimo valor, mas sinaliza falha no status.
-  soil=constrain(100.0f*(SOIL_DRY-adc)/(SOIL_DRY-SOIL_WET),0.0f,100.0f);
-  controlLoop();
-  Serial.printf("T %.1f H %.1f Solo %.1f Boia %d Fan %d Pump %d %s\n",
-     temp,hum,soil,tankOk,fanOn,pumpOn,alert.c_str());
+void maintainWiFi(unsigned long now)
+{
+  if (WiFi.status() == WL_CONNECTED)
+    return;
+  if (wifiAttempted && now - lastWifiTry < WIFI_RETRY)
+    return;
+  wifiAttempted = true;
+  lastWifiTry = now;
+  Serial.println("[WIFI] Tentando conectar...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD, 6);
 }
 
-// Reutiliza HTTPS/TLS quando USE_LOCAL_HTTP=false; HTTP apenas em rede de teste.
-bool request(const String& endpoint, const String& method, const String& payload, String& response){
-  if(WiFi.status()!=WL_CONNECTED)return false;
+void enforceSafety(unsigned long now)
+{
+  // Mesmo entre amostras, proteger bomba contra falta de agua e tempo maximo.
+  if (pumpOn && (!reservoirOK || !sensorOK ||
+                 digitalRead(PIN_TANK) != LOW || now - pumpStart >= MAX_PUMP_MS))
+  {
+    stopPump(now);
+  }
+  if (sensorOK && now - lastValidDht > DHT_STALE_MS)
+  {
+    sensorOK = false;
+    fanOn = false;
+    growLightOn = false;
+    stopPump(now);
+    digitalWrite(PIN_FAN, LOW);
+    digitalWrite(PIN_GROWLIGHT, LOW);
+    Serial.println("[ALERTA] DHT22 indisponivel por tempo prolongado");
+  }
+}
+
+void sampleAndControl(unsigned long now)
+{
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  if (isfinite(t) && isfinite(h) && t >= -40 && t <= 80 && h >= 0 && h <= 100)
+  {
+    tempC = t;
+    airPct = h;
+    lastValidDht = now;
+    sensorOK = true;
+  }
+  else if (!sensorOK || now - lastValidDht > DHT_STALE_MS)
+  {
+    sensorOK = false;
+  }
+
+  reservoirOK = digitalRead(PIN_TANK) == LOW;
+  long soilSum = 0, lightSum = 0;
+  for (int i = 0; i < 8; ++i)
+  {
+    soilSum += analogRead(PIN_SOIL);
+    lightSum += analogRead(PIN_LIGHT);
+  }
+  int soilRaw = soilSum / 8;
+  int lightRaw = lightSum / 8;
+  soilPct = constrain(100.0f * (RAW_DRY - soilRaw) / (RAW_DRY - RAW_WET), 0.0f, 100.0f);
+  // LDR no Wokwi: leitura ADC alta significa menor iluminacao nesta ligacao.
+  // Inverter para que luminosity (%) aumente quando o ambiente fica mais claro.
+  lightPct = constrain(100.0f * (4095 - lightRaw) / 4095.0f, 0.0f, 100.0f);
+
+  if (!sensorOK)
+  {
+    fanOn = false;
+    growLightOn = false;
+    stopPump(now);
+  }
+  else
+  {
+    if (tempC >= TEMP_FAN_ON || airPct >= HUMIDITY_FAN_ON)
+      fanOn = true;
+    else if (tempC <= TEMP_FAN_OFF && airPct <= HUMIDITY_FAN_OFF)
+      fanOn = false;
+
+    if (lightPct < LIGHT_GROW_ON)
+      growLightOn = true;
+    else if (lightPct > LIGHT_GROW_OFF)
+      growLightOn = false;
+
+    if (pumpOn && (soilPct >= SOIL_PUMP_OFF || !reservoirOK || now - pumpStart >= MAX_PUMP_MS))
+    {
+      stopPump(now);
+    }
+    if (cooldown && now - pumpStopped >= PUMP_COOLDOWN_MS)
+      cooldown = false;
+    if (!pumpOn && !cooldown && reservoirOK && soilPct <= SOIL_PUMP_ON)
+    {
+      pumpOn = true;
+      pumpStart = now;
+      Serial.println("[BOMBA] Irrigacao iniciada");
+    }
+  }
+
+  digitalWrite(PIN_FAN, fanOn ? HIGH : LOW);
+  digitalWrite(PIN_PUMP, pumpOn ? HIGH : LOW);
+  digitalWrite(PIN_GROWLIGHT, growLightOn ? HIGH : LOW);
+  Serial.printf("[ESTUFA] T=%.1f C Ar=%.1f%% Solo=%.1f%% Luz=%.1f%% Agua=%s Fan=%s Bomba=%s Cultivo=%s\n",
+                tempC, airPct, soilPct, lightPct, reservoirOK ? "SIM" : "NAO",
+                fanOn ? "ON" : "OFF", pumpOn ? "ON" : "OFF", growLightOn ? "ON" : "OFF");
+
+  if (oledReady)
+  {
+    oled.clearDisplay();
+    oled.setCursor(0, 0);
+    oled.setTextSize(1);
+    oled.println("ESTUFA INTELIGENTE");
+    if (sensorOK)
+      oled.printf("Temp: %.1f C\nAr: %.1f %%\n", tempC, airPct);
+    else
+      oled.println("DHT: FALHA");
+    oled.printf("Solo: %.0f %% Luz: %.0f %%\n", soilPct, lightPct);
+    oled.printf("Agua: %s\n", reservoirOK ? "SIM" : "NAO");
+    oled.printf("F:%d B:%d L:%d\n", fanOn, pumpOn, growLightOn);
+    oled.display();
+  }
+}
+
+// Envio HTTPS isolado: nao executar outros handshakes TLS no setup.
+// Uma falha na rede nunca deve alterar a decisao automatica da estufa.
+void imprimirErroTLS(WiFiClientSecure &tls, int httpCode)
+{
+  char mensagem[160] = {0};
+  int tlsCode = tls.lastError(mensagem, sizeof(mensagem));
+  Serial.printf("[API] HTTP=%d WiFi=%d heap=%u\n", httpCode,
+                WiFi.status(), (unsigned)ESP.getFreeHeap());
+  Serial.printf("[API] TLS=%d %s\n", tlsCode, mensagem);
+  if (tlsCode == -29312)
+  {
+    Serial.println("[API] EOF no handshake TLS; verificar gateway Wokwi/cadeia TLS.");
+  }
+}
+
+void sendTelemetry()
+{
+  if (!sensorOK)
+  {
+    Serial.println("[API] Sem envio: DHT22 invalido");
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("[API] Sem envio: Wi-Fi desconectado");
+    return;
+  }
+  if (!strlen(DEVICE_KEY))
+  {
+    Serial.println("[API] Falta DEVICE_KEY de teste");
+    return;
+  }
+  if (strncmp(API_URL, "https://", 8) != 0)
+  {
+    Serial.println("[API] URL deve iniciar com https://");
+    return;
+  }
+  if (time(nullptr) < 1700000000)
+  {
+    Serial.println("[API] Aguardando sincronizacao NTP");
+    return;
+  }
+  WiFiClientSecure tls;
+  // MODO ACADEMICO: criptografa, mas nao autentica o servidor.
+  // Nunca usar com credenciais de producao ou hardware real.
+  tls.setInsecure();
+  tls.setTimeout(8000);
   HTTPClient http;
-  bool beginOk=false;
-  WiFiClient plain;
-  WiFiClientSecure secure;
-  String url=String(SERVER_URL)+endpoint;
-  if(USE_LOCAL_HTTP){beginOk=http.begin(plain,url);}
-  else {secure.setCACert(ROOT_CA);beginOk=http.begin(secure,url);}
-  if(!beginOk)return false;
-  http.setTimeout(3500);
-  http.addHeader("X-Device-Key",DEVICE_KEY);
-  if(method=="POST")http.addHeader("Content-Type","application/json");
-  int status=(method=="POST")?http.POST(payload):http.GET();
-  if(status>=200&&status<300)response=http.getString();
-  http.end();
-  if(status<200||status>=300){Serial.printf("HTTP erro %d\n",status);return false;}
-  return true;
-}
-
-void syncSettings(){
-  String response;
-  if(!request(String("/api/device/settings?device_id=")+DEVICE_ID,"GET","",response))return;
-  JsonDocument doc;
-  if(deserializeJson(doc,response))return;
-  const char* receivedMode=doc["mode"] | "auto";
-  mode=String(receivedMode)=="manual"?"manual":"auto";
-  target=constrain(doc["temp_target"].as<float>(),10.0f,45.0f);
-  soilMin=constrain(doc["soil_min"].as<float>(),0.0f,95.0f);
-  soilStop=constrain(doc["soil_stop"].as<float>(),soilMin+1.0f,100.0f);
-  manualFan=doc["manual_fan"].as<bool>();
-  manualPump=doc["manual_pump"].as<bool>();
-  controlLoop();
-}
-
-void sendTelemetry(){
-  JsonDocument doc;
-  doc["device_id"]=DEVICE_ID;
-  if(sensorsOk){doc["temperature"]=temp;doc["humidity"]=hum;}
-  else {doc["temperature"]=nullptr;doc["humidity"]=nullptr;}
-  doc["soil"]=soil;
-  doc["light"]=nullptr; // Sensor BH1750 opcional, nao instalado nesta versao.
-  doc["tank_ok"]=tankOk;
-  doc["fan"]=fanOn;doc["pump"]=pumpOn;
-  doc["mode"]=mode;doc["alert"]=alert;
-  String json,response;
-  serializeJson(doc,json);
-  request("/api/device/telemetry","POST",json,response);
-}
-
-void setup(){
-  Serial.begin(115200);
-  pinMode(FAN_PIN,OUTPUT);pinMode(PUMP_PIN,OUTPUT);
-  digitalWrite(FAN_PIN,LOW);digitalWrite(PUMP_PIN,LOW);
-  pinMode(FLOAT_PIN,INPUT_PULLUP);
-  analogReadResolution(12);
-  dht.begin();WiFi.mode(WIFI_STA);WiFi.begin(WIFI_SSID,WIFI_PASS);
-  lastSample=millis()-SAMPLE_MS;
-  lastSync=millis()-SYNC_MS;
-}
-void loop(){
-  unsigned long ms=millis();
-  if(WiFi.status()!=WL_CONNECTED&&ms-lastWiFiRetry>WIFI_RETRY_MS){
-    lastWiFiRetry=ms;WiFi.reconnect();
+  http.setConnectTimeout(8000);
+  http.setTimeout(8000);
+  http.setReuse(false);
+  if (!http.begin(tls, API_URL))
+  {
+    Serial.println("[API] http.begin() falhou");
+    return;
   }
-  if(ms-lastSample>=SAMPLE_MS){lastSample=ms;sample();sendTelemetry();}
-  if(ms-lastSync>=SYNC_MS){lastSync=ms;syncSettings();}
-  // Proteger contra bomba travada mesmo se comunicacao bloquear ou sensores falharem.
-  if(pumpOn && millis()-pumpStarted>=PUMP_MAX_MS)setPump(false);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Device-Key", DEVICE_KEY);
+  char data[400];
+  // luminosity: percentual estimado de iluminacao; NAO corresponde a lux.
+  int n = snprintf(data, sizeof(data),
+                   "{\"device_id\":\"%s\",\"temperature\":%.2f,\"air_humidity\":%.2f,"
+                   "\"soil_moisture\":%.2f,\"luminosity\":%.2f,\"reservoir_ok\":%s,"
+                   "\"fan_on\":%s,\"pump_on\":%s}",
+                   DEVICE_ID, tempC, airPct, soilPct, lightPct,
+                   reservoirOK ? "true" : "false", fanOn ? "true" : "false", pumpOn ? "true" : "false");
+  if (n <= 0 || n >= (int)sizeof(data))
+  {
+    Serial.println("[API] Erro: payload excedeu buffer");
+    http.end();
+    return;
+  }
+  Serial.println("[API] Enviando telemetria HTTPS...");
+  int status = http.POST((uint8_t *)data, (size_t)n);
+  if (status == 201)
+  {
+    Serial.println("[API] HTTP 201: medicao gravada no Supabase");
+  }
+  else if (status > 0)
+  {
+    Serial.printf("[API] HTTP %d: %s\n", status, http.getString().c_str());
+  }
+  else
+  {
+    Serial.printf("[API] Falha HTTP %d: %s\n", status,
+                  http.errorToString(status).c_str());
+    imprimirErroTLS(tls, status);
+  }
+  http.end();
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  pinMode(PIN_TANK, INPUT_PULLUP);
+  pinMode(PIN_FAN, OUTPUT);
+  pinMode(PIN_PUMP, OUTPUT);
+  pinMode(PIN_GROWLIGHT, OUTPUT);
+  digitalWrite(PIN_FAN, LOW);
+  digitalWrite(PIN_PUMP, LOW);
+  digitalWrite(PIN_GROWLIGHT, LOW);
+  analogReadResolution(12);
+  dht.begin();
+  Wire.begin(21, 22);
+  oledReady = oled.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  if (oledReady)
+  {
+    oled.clearDisplay();
+    oled.setTextColor(SSD1306_WHITE);
+    oled.display();
+  }
+  WiFi.mode(WIFI_STA);
+  maintainWiFi(millis());
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  Serial.println("=== ESTUFA INTELIGENTE - DEMONSTRACAO WOKWI ===");
+  Serial.println("Sensores/atuadores locais ativos mesmo sem nuvem");
+  Serial.println("[TLS] Modo demonstracao: validacao de CA desativada");
+}
+
+void loop()
+{
+  unsigned long now = millis();
+  maintainWiFi(now);
+  enforceSafety(now);
+  if (now >= 2500 && (lastSample == 0 || now - lastSample >= SENSOR_PERIOD))
+  {
+    lastSample = now;
+    sampleAndControl(now);
+  }
+  if (now >= 2500 && (lastPost == 0 || now - lastPost >= POST_PERIOD))
+  {
+    lastPost = now;
+    sendTelemetry();
+  }
+  delay(10);
 }

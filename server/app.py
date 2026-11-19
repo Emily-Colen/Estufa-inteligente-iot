@@ -11,6 +11,9 @@ app = FastAPI(
     description="API para monitoramento da estufa"
 )
 
+from dashboard_routes import register_dashboard
+register_dashboard(app)
+
 @app.get("/")
 def inicio():
     return {
